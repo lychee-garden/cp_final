@@ -1,159 +1,200 @@
-# -*- coding: utf-8 -*-
+# -*- coding: GB2312 -*-
 import numpy as np
 import matplotlib.pyplot as plt
-from scipy.constants import c, epsilon_0, mu_0, pi
-import scipy.sparse.linalg as spla
-from scipy import integrate
+import scipy.linalg
+from matplotlib.collections import LineCollection
 import time
 
-class CylinderRCSSolver:
-    def __init__(self, radius=1.5, height=6.0, freq=200e6):
-        self.radius, self.height, self.freq = radius, height, freq
-        self.wavelength = c / freq
-        self.k = 2 * pi / self.wavelength
-        self.eta = np.sqrt(mu_0 / epsilon_0)
+c = 3e8
+mu0 = 4 * np.pi * 1e-7
+eps0 = 8.854e-12
+eta0 = 377.0
 
-    def generate_mesh(self, segments_per_wavelength=10):
-        segments_circum = max(8, int(2 * pi * self.radius * segments_per_wavelength / self.wavelength))
-        segments_height = max(4, int(self.height * segments_per_wavelength / self.wavelength))
-        theta = np.linspace(0, 2*pi, segments_circum, endpoint=False)
-        z_values = np.linspace(0, self.height, segments_height)
-        vertices = []
-        for i in range(segments_height):
-            for j in range(segments_circum):
-                vertices.append([self.radius * np.cos(theta[j]), self.radius * np.sin(theta[j]), z_values[i]])
-        faces = []
-        for i in range(segments_height - 1):
-            for j in range(segments_circum):
-                idx1 = i * segments_circum + j
-                idx2 = i * segments_circum + (j + 1) % segments_circum
-                idx3 = (i + 1) * segments_circum + j
-                idx4 = (i + 1) * segments_circum + (j + 1) % segments_circum
-                faces.append([idx1, idx2, idx3])
-                faces.append([idx2, idx4, idx3])
-        self.vertices = np.array(vertices)
-        self.faces = np.array(faces)
-        return self.vertices, self.faces
+freq = 200e6
+lam = c / freq
+k = 2 * np.pi / lam
+omega = 2 * np.pi * freq
 
-    def rwg_basis_functions(self, vertices, faces):
-        edge_to_face = {}
-        for i, face in enumerate(faces):
-            for j in range(3):
-                edge = tuple(sorted([face[j], face[(j+1)%3]]))
-                edge_to_face[edge] = edge_to_face.get(edge, []) + [i]
-        basis_functions = []
-        for edge, face_indices in edge_to_face.items():
-            if len(face_indices) == 2:
-                basis_functions.append({'edge': edge, 'faces': face_indices, 'length': np.linalg.norm(vertices[edge[1]] - vertices[edge[0]])})
-        return basis_functions
+radius = 1.5
+height = 6.0
+z_bottom = 0.0
+z_top = height
 
-    def green_function(self, r, r_prime):
-        R = np.linalg.norm(r - r_prime)
-        return 0.0 if R < 1e-12 else np.exp(1j * self.k * R) / (4 * pi * R)
+n_circum = 40
+n_height = 30
+n_radial = 12
 
-    def incident_field(self, observation_point):
-        k_vec = np.array([0, 0, -self.k])
-        return 1.0 * np.array([1, 0, 0]) * np.exp(1j * np.dot(k_vec, observation_point))
+print(f"Frequency={freq/1e6} MHz, Wavelength={lam} m")
+print(f"Cylinder: radius={radius} m, height={height} m")
 
-    def fill_impedance_matrix(self, vertices, faces, basis_functions):
-        N = len(basis_functions)
-        Z = np.zeros((N, N), dtype=complex)
-        print("Filling impedance matrix...")
-        for i, bf_i in enumerate(basis_functions):
-            center_i = np.mean(vertices[list(bf_i['edge'])], axis=0)
-            for j, bf_j in enumerate(basis_functions):
-                center_j = np.mean(vertices[list(bf_j['edge'])], axis=0)
-                R = np.linalg.norm(center_i - center_j)
-                if i == j:
-                    Z[i, j] = complex(1.0, 0.0)
+class MeshElement:
+    def __init__(self, pos, normal, area, u_vec, v_vec):
+        self.pos = np.array(pos)
+        self.normal = np.array(normal)
+        self.area = area
+        self.u_vec = np.array(u_vec)
+        self.v_vec = np.array(v_vec)
+
+elements = []
+
+dz = height / n_height
+dphi = 2 * np.pi / n_circum
+
+for i in range(n_height):
+    z = z_bottom + (i + 0.5) * dz
+    for j in range(n_circum):
+        phi = j * dphi
+        x = radius * np.cos(phi)
+        y = radius * np.sin(phi)
+        pos = [x, y, z]
+        normal = [np.cos(phi), np.sin(phi), 0]
+        area = (radius * dphi) * dz
+        u_vec = [0, 0, 1]
+        v_vec = [-np.sin(phi), np.cos(phi), 0]
+        elements.append(MeshElement(pos, normal, area, u_vec, v_vec))
+
+def create_cap_mesh(z_level, is_top):
+    dr = radius / n_radial
+    nz = 1 if is_top else -1
+    normal = [0, 0, nz]
+    for i in range(n_radial):
+        r_inner = i * dr
+        r_outer = (i + 1) * dr
+        r_mid = (r_inner + r_outer) / 2
+        current_circum_n = max(4, int(n_circum * (r_mid / radius)))
+        dphi_cap = 2 * np.pi / current_circum_n
+        for j in range(current_circum_n):
+            phi = j * dphi_cap + (0.5 * dphi_cap if i%2 else 0)
+            x = r_mid * np.cos(phi)
+            y = r_mid * np.sin(phi)
+            pos = [x, y, z_level]
+            area = (np.pi * (r_outer**2 - r_inner**2)) / current_circum_n
+            u_vec = [np.cos(phi), np.sin(phi), 0]
+            v_vec = [-np.sin(phi), np.cos(phi), 0]
+            elements.append(MeshElement(pos, normal, area, u_vec, v_vec))
+
+create_cap_mesh(z_bottom, is_top=False)
+create_cap_mesh(z_top, is_top=True)
+
+N_elem = len(elements)
+N_unknowns = 2 * N_elem
+print(f"Mesh: {N_elem} elements, {N_unknowns}x{N_unknowns} matrix")
+
+Z = np.zeros((N_unknowns, N_unknowns), dtype=complex)
+V = np.zeros(N_unknowns, dtype=complex)
+
+print("Filling impedance matrix...")
+start_time = time.time()
+
+positions = np.array([e.pos for e in elements])
+areas = np.array([e.area for e in elements])
+basis_vecs = []
+for e in elements:
+    basis_vecs.append(e.u_vec)
+    basis_vecs.append(e.v_vec)
+basis_vecs = np.array(basis_vecs)
+
+const_factor = 1j * omega * mu0 / (4 * np.pi)
+
+for m in range(N_elem):
+    r_m = positions[m]
+    for i_pol in range(2):
+        row = 2 * m + i_pol
+        t_vec = elements[m].u_vec if i_pol == 0 else elements[m].v_vec
+        for n in range(N_elem):
+            r_n = positions[n]
+            dist = np.linalg.norm(r_m - r_n)
+            for j_pol in range(2):
+                col = 2 * n + j_pol
+                s_vec = elements[n].u_vec if j_pol == 0 else elements[n].v_vec
+                if m != n:
+                    g = np.exp(-1j * k * dist) / dist
+                    elem_z = const_factor * np.dot(t_vec, s_vec) * g * areas[n]
                 else:
-                    Z[i, j] = complex(0.1, 0.0) * np.exp(1j * self.k * R) / (1.0 + R / self.wavelength)
-            if i % max(1, N//10) == 0:
-                print(f"Progress: {i+1}/{N}")
-        return Z
+                    a_eq = np.sqrt(areas[n] / np.pi)
+                    elem_z = const_factor * (2 * np.pi * a_eq) * (1 - 0.5j * k * a_eq)
+                Z[row, col] = elem_z
+    if m % 50 == 0:
+        print(f"\rProgress: {m}/{N_elem}", end="")
 
-    def solve_surface_current(self, vertices, faces, basis_functions):
-        N = len(basis_functions)
-        Z = self.fill_impedance_matrix(vertices, faces, basis_functions)
-        V = np.zeros(N, dtype=complex)
-        for i, bf in enumerate(basis_functions):
-            edge_center = np.mean(vertices[list(bf['edge'])], axis=0)
-            E_inc = self.incident_field(edge_center)
-            edge_vec = vertices[bf['edge'][1]] - vertices[bf['edge'][0]]
-            edge_length = np.linalg.norm(edge_vec)
-            if edge_length > 1e-12:
-                edge_dir = edge_vec / edge_length
-                V[i] = np.dot(E_inc, edge_dir) * edge_length
-            else:
-                V[i] = np.dot(E_inc, [1, 0, 0])
-        print("Solving matrix equation...")
-        return spla.gmres(Z, V, atol=1e-6, maxiter=1000)[0]
+print(f"\nMatrix filled in {time.time() - start_time:.2f}s")
 
-    def calculate_rcs(self, theta_angles, phi=0):
-        vertices, faces = self.generate_mesh()
-        basis_functions = self.rwg_basis_functions(vertices, faces)
-        I = self.solve_surface_current(vertices, faces, basis_functions)
-        rcs_db = []
-        for theta in theta_angles:
-            theta_rad = np.radians(theta)
-            r_hat = np.array([np.sin(theta_rad) * np.cos(phi), np.sin(theta_rad) * np.sin(phi), np.cos(theta_rad)])
-            f_scat = 0j
-            for i, bf in enumerate(basis_functions):
-                edge_center = np.mean(vertices[list(bf['edge'])], axis=0)
-                edge_vec = vertices[bf['edge'][1]] - vertices[bf['edge'][0]]
-                edge_length = np.linalg.norm(edge_vec)
-                if edge_length > 1e-12:
-                    edge_dir = edge_vec / edge_length
-                    phase = np.exp(-1j * self.k * np.dot(r_hat, edge_center))
-                    f_scat += I[i] * edge_length * np.dot(edge_dir, r_hat) * phase
-            rcs = (4 * pi / (self.k**2)) * np.abs(f_scat)**2
-            rcs_db.append(10 * np.log10(rcs) if rcs > 0 else -100)
-        return np.array(rcs_db)
+E0_amp = 1.0
+k_vec_inc = np.array([0, 0, -k])
 
-    def plot_rcs(self, theta_angles, rcs_db, save_path='rcs_cartesian.png'):
-        plt.figure(figsize=(10, 6))
-        plt.plot(theta_angles, rcs_db, 'b-', linewidth=2)
-        plt.xlabel('Elevation Angle theta (deg)')
-        plt.ylabel('Bistatic RCS (dBsm)')
-        plt.title(f'PEC Cylinder Bistatic RCS (f={self.freq/1e6}MHz)')
-        plt.grid(True, alpha=0.3)
-        plt.xlim(0, 180)
-        plt.tight_layout()
-        plt.savefig(save_path, dpi=300, bbox_inches='tight')
-        print(f"Cartesian plot saved to {save_path}")
-        plt.show()
+for m in range(N_elem):
+    r = positions[m]
+    phase = np.exp(-1j * np.dot(k_vec_inc, r))
+    E_inc_vector = np.array([1.0, 0.0, 0.0]) * E0_amp * phase
+    V[2*m] = np.dot(E_inc_vector, elements[m].u_vec)
+    V[2*m + 1] = np.dot(E_inc_vector, elements[m].v_vec)
 
-    def plot_rcs_polar(self, theta_angles, rcs_db, save_path='rcs_polar.png'):
-        theta_rad = np.radians(theta_angles)
-        theta_full = np.concatenate([theta_rad, 2*np.pi - theta_rad[::-1][1:]])
-        rcs_full = np.concatenate([rcs_db, rcs_db[::-1][1:]])
-        plt.figure(figsize=(10, 10))
-        ax = plt.subplot(111, projection='polar')
-        ax.plot(theta_full, rcs_full, 'b-', linewidth=2)
-        ax.set_theta_zero_location('N')
-        ax.set_theta_direction(-1)
-        ax.set_ylim(np.min(rcs_db) - 5, np.max(rcs_db) + 5)
-        ax.set_title(f'PEC Cylinder Bistatic RCS (Polar) (f={self.freq/1e6}MHz)', pad=20)
-        ax.grid(True, alpha=0.3)
-        plt.tight_layout()
-        plt.savefig(save_path, dpi=300, bbox_inches='tight')
-        print(f"Polar plot saved to {save_path}")
-        plt.show()
+print("Solving linear system...")
+I_coeffs = scipy.linalg.solve(Z, V)
+print("Done.")
 
-def main():
-    print("Starting PEC cylinder bistatic RCS calculation...")
-    solver = CylinderRCSSolver(radius=1.5, height=6.0, freq=200e6)
-    vertices, faces = solver.generate_mesh(segments_per_wavelength=15)
-    print(f"Generated mesh: {len(vertices)} vertices, {len(faces)} faces")
-    theta_angles = np.linspace(0, 180, 181)
-    print("Starting RCS calculation...")
-    start_time = time.time()
-    rcs_db = solver.calculate_rcs(theta_angles)
-    print(f"Calculation completed, elapsed time: {time.time() - start_time:.2f} seconds")
-    solver.plot_rcs(theta_angles, rcs_db)
-    solver.plot_rcs_polar(theta_angles, rcs_db)
-    np.savetxt('rcs_results.csv', np.column_stack((theta_angles, rcs_db)), delimiter=',', header='Theta(deg),RCS(dBsm)', fmt='%.3f')
-    print("Results saved to rcs_results.csv")
+def calculate_rcs(theta_list, phi=0):
+    rcs_values = []
+    r_const = 1j * k * eta0 / (4 * np.pi)
+    for theta_deg in theta_list:
+        theta = np.deg2rad(theta_deg)
+        rx = np.sin(theta) * np.cos(phi)
+        ry = np.sin(theta) * np.sin(phi)
+        rz = np.cos(theta)
+        r_hat = np.array([rx, ry, rz])
+        E_theta = 0
+        E_phi = 0
+        for n in range(N_elem):
+            J_n = I_coeffs[2*n] * elements[n].u_vec + I_coeffs[2*n+1] * elements[n].v_vec
+            phase_factor = np.exp(1j * k * np.dot(positions[n], r_hat))
+            theta_hat = np.array([np.cos(theta)*np.cos(phi), np.cos(theta)*np.sin(phi), -np.sin(theta)])
+            phi_hat = np.array([-np.sin(phi), np.cos(phi), 0])
+            E_theta += np.dot(J_n, theta_hat) * phase_factor * areas[n]
+            E_phi += np.dot(J_n, phi_hat) * phase_factor * areas[n]
+        E_s_mag = np.sqrt(abs(E_theta)**2 + abs(E_phi)**2) * k * eta0 / (4*np.pi)
+        sigma = 4 * np.pi * E_s_mag**2
+        rcs_db = 10 * np.log10(sigma + 1e-20)
+        rcs_values.append(rcs_db)
+    return rcs_values
 
-if __name__ == "__main__":
-    main()
+thetas = np.linspace(0, 180, 1801)
+rcs_result = calculate_rcs(thetas, phi=0)
+
+plt.figure(figsize=(10, 6))
+plt.plot(thetas, rcs_result, label='MoM Calculated', linewidth=2)
+plt.title(f'Bistatic RCS of PEC Cylinder (Freq={freq/1e6} MHz)\nRadius={radius}m, Height={height}m')
+plt.xlabel('Theta (degrees)')
+plt.ylabel('RCS (dBsm)')
+plt.grid(True)
+plt.legend()
+plt.axvline(x=90, color='r', linestyle='--', alpha=0.3, label='Broadside')
+plt.text(10, min(rcs_result)+5, 'Backscatter\n(Reflection)', ha='center')
+plt.text(180, min(rcs_result)+5, 'Forward Scatter\n(Shadowing)', ha='center')
+plt.tight_layout()
+plt.show()
+
+theta_rad = np.deg2rad(thetas)
+theta_full = np.concatenate([theta_rad, 2*np.pi - theta_rad[-2:0:-1]])
+rcs_full = np.concatenate([rcs_result, rcs_result[-2:0:-1]])
+fig = plt.figure(figsize=(10, 8))
+ax = fig.add_subplot(111, projection='polar')
+ax.set_theta_zero_location("N")
+ax.set_theta_direction(-1)
+points = np.array([theta_full, rcs_full]).T.reshape(-1, 1, 2)
+segments = np.concatenate([points[:-1], points[1:]], axis=1)
+norm = plt.Normalize(vmin=np.min(rcs_full), vmax=np.max(rcs_full))
+lc = LineCollection(segments, cmap='jet', norm=norm)
+lc.set_array(rcs_full)
+lc.set_linewidth(2)
+ax.add_collection(lc)
+
+# change the y axis range
+ax.set_ylim(0, np.max(rcs_full))
+cbar = fig.colorbar(lc, ax=ax, pad=0.1)
+cbar.set_label('RCS (dBsm)')
+ax.grid(True, alpha=0.5, color='gray')
+ax.set_title(f'Bistatic RCS Polar Plot (Freq={freq/1e6} MHz)', va='bottom')
+ax.text(0, np.max(rcs_full)+3, '0бу (Top/Backscatter)', ha='center', color='red', fontsize=8)
+ax.text(np.pi, np.max(rcs_full)+3, '180бу (Bottom/Forward)', ha='center', color='blue', fontsize=8)
+plt.tight_layout()
+plt.show()
