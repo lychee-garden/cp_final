@@ -158,7 +158,7 @@ def calculate_rcs(theta_list, phi=0):
     return rcs_values
 
 thetas = np.linspace(0, 180, 1801)
-rcs_result = calculate_rcs(thetas, phi=0)
+rcs_result = calculate_rcs(thetas, phi=np.pi/2)
 
 plt.figure(figsize=(10, 6))
 plt.plot(thetas, rcs_result, label='MoM Calculated', linewidth=2)
